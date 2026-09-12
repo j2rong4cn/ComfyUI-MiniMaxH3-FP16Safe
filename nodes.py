@@ -48,33 +48,8 @@ import copy as _copy
 
 import torch
 import comfy.model_management
-from comfy.ldm.modules import attention as attn_mod
-
-# --- defensive imports ---
-try:
-    import comfy.ops as _comfy_ops
-except Exception:
-    _comfy_ops = None
-try:
-    import comfy.rmsnorm as _comfy_rmsnorm
-except Exception:
-    _comfy_rmsnorm = None
-try:
-    import comfy.quant_ops as _comfy_quant_ops
-except Exception:
-    _comfy_quant_ops = None
-try:
-    import comfy.ldm.minimax.model as mm_model
-    MINIMAX_AVAILABLE = True
-    _IMPORT_ERR = None
-except Exception as e:
-    mm_model = None
-    MINIMAX_AVAILABLE = False
-    _IMPORT_ERR = e
-
-ck = getattr(_comfy_quant_ops, "ck", None)
-_ORIG_OPT = getattr(attn_mod, "optimized_attention", None)
-
+from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+import comfy.ldm.minimax.model as mm_model
 
 class _FP32RMSNorm(torch.nn.Module):
     """RMSNorm computing in fp32, keeping I/O dtype. Exposes .weight/.eps/.bias."""
@@ -281,31 +256,23 @@ def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
         qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
         kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
         rot = rope_freqs.shape[-3] * 2
-        if ck is not None:
-            if comfy.model_management.in_training:
-                q, k = ck.rms_rope_split_half(
-                    q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
-            else:
-                ck.rms_rope_split_half_(
-                    q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
+        if comfy.model_management.in_training:
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(
+                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
         else:
-            q = self.q_norm(q[0]).unsqueeze(0)
-            k = self.k_norm(k[0]).unsqueeze(0)
-            print("[MiniMaxH3-FP16Safe] WARNING: comfy_kitchen missing, rope skipped.")
+            comfy.quant_ops.ck.rms_rope_split_half_(
+                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
         q = q[0]
         k = k[0]
     else:
         q = self.q_norm(q.view(s, self.heads, self.head_dim))
         k = self.k_norm(k.view(s, self.heads, self.head_dim))
-    # [1, heads, s, hd]; q/k restored to O(1) by RMSNorm, v still /16
-    q = q.transpose(0, 1).unsqueeze(0)
-    k = k.transpose(0, 1).unsqueeze(0)
-    v = v.transpose(0, 1).unsqueeze(0)
-    if q.dtype == torch.float16:
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)   # fp16 Tensor-Core SDPA
-    else:
-        out = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float())
-    out = out.transpose(1, 2).reshape(s, -1)                              # [s, heads*hd]
+
+    q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
+    k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
+    v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+    out = optimized_attention(q, k, v, self.heads, mask=None, skip_reshape=True, transformer_options=transformer_options)
+    out = out.squeeze(0)
     proj = self.out_proj(out)                                             # fp16, bounded <= ~2400
     proj = proj.float() * _ATTN_FIXED_SCALE                               # unscale v in fp32
     if not _FP32_MODE:
@@ -336,11 +303,9 @@ def _prof_block(i, kind, dt_attn, dt_mlp, dt_other):
 
 def _dit_block_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
     _t = _time.time()
-    _mss = mm_model._mod_scale_shift
-    _mg = mm_model._mod_gate
     x = x.float()
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
-    h = _mss(self.norm1(x), shift_msa, scale_msa, mod_segments)
+    h = mm_model._mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
     _t1 = _time.time()
     # V4: _fp16_safe pre-check kept -- it downcasts safe residuals to fp16 here
     # so q_norm/k_norm (_FP32RMSNorm) output stays fp16 and SDPA stays on the
@@ -348,11 +313,11 @@ def _dit_block_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_opt
     attn_out = self.attn(_fp16_safe(h), rope_freqs=rope_freqs,
                          transformer_options=transformer_options).float()
     _t2 = _time.time()
-    x = _mg(x, gate_msa, attn_out, mod_segments)
-    h = _mss(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
+    x = mm_model._mod_gate(x, gate_msa, attn_out, mod_segments)
+    h = mm_model._mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
     mlp_out = self.mlp(_fp16_safe(h)).float()
     _t3 = _time.time()
-    out = _mg(x, gate_mlp, mlp_out, mod_segments)
+    out = mm_model._mod_gate(x, gate_mlp, mlp_out, mod_segments)
     _t4 = _time.time()
     if _PROFILE:
         idx = getattr(self, "_dbg_index", -1)
@@ -468,11 +433,6 @@ class MiniMaxH3FP16Safe:
     CATEGORY = "MiniMaxH3"
 
     def patch(self, model, debug_nan=False, profile=False):
-        if not MINIMAX_AVAILABLE:
-            print("[MiniMaxH3-FP16Safe] comfy.ldm.minimax backend not found (%s). "
-                  "Update ComfyUI to a build that includes PR #15224." % _IMPORT_ERR)
-            return (model,)
-
         # ---- v6.6.0 (Issue #2 fix): 在 clone 上 patch, 隔离 ModelPatcher 持久状态 ----
         # set_model_compute_dtype 会把 manual_cast_dtype + force_cast_weights 写入
         # ModelPatcher.model_options/属性 (持久状态), 而 UNETLoader 输出被 ComfyUI 缓存。
@@ -564,8 +524,7 @@ class MiniMaxH3FP16Safe:
             _FUSE_FLAG = None
             _FP32_MODE = False
             print("[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, %d modules): "
-                  "fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + "
-                  "fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
+                  "fp32 residual stream + fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
                   "zero per-block GPU syncs (deferred fuse, fwd_wrapped=%d). "
                   "(profile=%s)" % (patched, n, wrapped_cond, fwd_wrapped, _PROFILE))
 
